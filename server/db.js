@@ -34,6 +34,7 @@ function initializeDatabase() {
       fee_percentage DECIMAL(5,2) NOT NULL,
       fee_amount DECIMAL(15,2) NOT NULL,
       tx_hash TEXT,
+      error_details TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       completed_at TIMESTAMP,
       FOREIGN KEY (user_id) REFERENCES users(id)
@@ -75,7 +76,46 @@ function initializeDatabase() {
       details TEXT,
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
       FOREIGN KEY (admin_id) REFERENCES users(id)
-    )
+    );
+
+    DROP TABLE IF EXISTS fee_rules;
+    CREATE TABLE fee_rules (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      crypto_type TEXT NOT NULL,
+      price_range_start DECIMAL(10,2) NOT NULL,
+      price_range_end DECIMAL(10,2) NOT NULL,
+      fee_percentage DECIMAL(5,2) NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      CHECK (price_range_start < price_range_end)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_fee_rules_crypto_range ON fee_rules(crypto_type, price_range_start, price_range_end);
+
+    CREATE TABLE IF NOT EXISTS tickets (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id INTEGER NOT NULL,
+      subject TEXT NOT NULL,
+      message TEXT NOT NULL,
+      priority TEXT DEFAULT 'normal',
+      status TEXT DEFAULT 'open',
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE TABLE IF NOT EXISTS ticket_responses (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ticket_id INTEGER NOT NULL,
+      user_id INTEGER NOT NULL,
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      FOREIGN KEY (ticket_id) REFERENCES tickets(id),
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON tickets(user_id);
+    CREATE INDEX IF NOT EXISTS idx_tickets_status ON tickets(status);
+    CREATE INDEX IF NOT EXISTS idx_ticket_responses_ticket_id ON ticket_responses(ticket_id);
   `;
 
   try {
@@ -90,7 +130,8 @@ function initializeDatabase() {
     INSERT OR IGNORE INTO settings (key, value)
     VALUES 
       ('feePercentage', '22'),
-      ('cashappUsername', '')
+      ('cashappUsername', ''),
+      ('exchangeEnabled', 'true')
   `).run();
 }
 

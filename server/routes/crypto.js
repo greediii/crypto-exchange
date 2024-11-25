@@ -1,6 +1,7 @@
 const express = require('express');
 const router = express.Router();
 const axios = require('axios');
+const networkFeeService = require('../services/networkFees');
 
 // Cache prices for 30 seconds
 let priceCache = {
@@ -88,6 +89,16 @@ router.get('/prices', async (req, res) => {
       error: error.message,
       isRateLimit: error.response?.status === 429
     });
+  }
+});
+
+router.get('/network-fees', async (req, res) => {
+  try {
+    const fees = await networkFeeService.getAllFees();
+    res.json(fees);
+  } catch (error) {
+    console.error('Error getting network fees:', error);
+    res.status(500).json({ error: 'Failed to fetch network fees' });
   }
 });
 

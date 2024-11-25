@@ -7,22 +7,80 @@ const db = require('../db');
 router.post('/', auth, async (req, res) => {
   try {
     const { subject, message, priority } = req.body;
-    console.log('Creating ticket with:', { subject, message, priority });
     
-    const result = db.prepare(`
-      INSERT INTO tickets (user_id, subject, message, priority, status)
-      VALUES (?, ?, ?, ?, 'open')
-    `).run(req.user.userId, subject, message, priority);
+    console.log('Received ticket creation request:', {
+      userId: req.user.userId,
+      subject,
+      message,
+      priority
+    });
 
-    console.log('Ticket created with ID:', result.lastID);
+    // Validate required fields
+    if (!subject?.trim() || !message?.trim()) {
+      return res.status(400).json({ 
+        message: 'Subject and message are required' 
+      });
+    }
 
-    res.json({ 
-      id: result.lastID, 
-      message: 'Ticket created successfully' 
+    // Validate priority
+    const validPriorities = ['low', 'normal', 'high'];
+    const ticketPriority = priority || 'normal';
+    if (!validPriorities.includes(ticketPriority)) {
+      return res.status(400).json({
+        message: 'Invalid priority value'
+      });
+    }
+
+    // Begin transaction
+    const result = db.transaction(() => {
+      const stmt = db.prepare(`
+        INSERT INTO tickets (
+          user_id, 
+          subject, 
+          message, 
+          priority, 
+          status, 
+          created_at, 
+          updated_at
+        ) VALUES (?, ?, ?, ?, 'open', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+      `);
+
+      console.log('Executing SQL with params:', {
+        userId: req.user.userId,
+        subject,
+        message,
+        priority: ticketPriority
+      });
+
+      return stmt.run(
+        req.user.userId, 
+        subject.trim(), 
+        message.trim(), 
+        ticketPriority
+      );
+    })();
+
+    console.log('Ticket created with ID:', result.lastInsertRowid);
+
+    // Fetch and return the created ticket
+    const createdTicket = db.prepare(`
+      SELECT t.*, u.username as creator_username
+      FROM tickets t
+      JOIN users u ON t.user_id = u.id
+      WHERE t.id = ?
+    `).get(result.lastInsertRowid);
+
+    res.status(201).json({ 
+      message: 'Ticket created successfully',
+      ticket: createdTicket
     });
   } catch (error) {
     console.error('Ticket creation error:', error);
-    res.status(500).json({ message: 'Failed to create ticket' });
+    res.status(500).json({ 
+      message: 'Failed to create ticket',
+      error: error.message,
+      stack: process.env.NODE_ENV === 'development' ? error.stack : undefined
+    });
   }
 });
 
@@ -35,9 +93,12 @@ router.get('/my', auth, async (req, res) => {
       ORDER BY created_at DESC
     `).all(req.user.userId);
     
-    res.json(tickets);
+    // Return empty array if no tickets found
+    res.json(tickets || []);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch tickets' });
+    console.error('Error fetching tickets:', error);
+    // Return empty array instead of error for no tickets
+    res.json([]);
   }
 });
 
@@ -55,9 +116,12 @@ router.get('/all', auth, async (req, res) => {
       ORDER BY t.created_at DESC
     `).all();
     
-    res.json(tickets);
+    // Return empty array if no tickets found
+    res.json(tickets || []);
   } catch (error) {
-    res.status(500).json({ message: 'Failed to fetch tickets' });
+    console.error('Error fetching all tickets:', error);
+    // Return empty array instead of error for no tickets
+    res.json([]);
   }
 });
 
@@ -84,18 +148,37 @@ router.put('/:ticketId/status', auth, async (req, res) => {
 // Get ticket details with messages
 router.get('/:ticketId', auth, async (req, res) => {
   try {
-    console.log('==== GET TICKET DETAILS ====');
-    console.log('Ticket ID:', req.params.ticketId);
+    const ticketId = parseInt(req.params.ticketId);
     
+    if (isNaN(ticketId)) {
+      return res.status(400).json({ 
+        message: 'Invalid ticket ID' 
+      });
+    }
+
+    console.log('Fetching ticket details:', { ticketId });
+
     const ticket = db.prepare(`
       SELECT t.*, u.username as creator_username
       FROM tickets t
       JOIN users u ON t.user_id = u.id
       WHERE t.id = ?
-    `).get(req.params.ticketId);
+    `).get(ticketId);
 
     if (!ticket) {
-      return res.status(404).json({ message: 'Ticket not found' });
+      return res.status(404).json({ 
+        message: 'Ticket not found' 
+      });
+    }
+
+    // Check if user has access to this ticket
+    if (req.user.role !== 'admin' && 
+        req.user.role !== 'owner' && 
+        req.user.role !== 'support' && 
+        ticket.user_id !== req.user.userId) {
+      return res.status(403).json({ 
+        message: 'Unauthorized to view this ticket' 
+      });
     }
 
     const responses = db.prepare(`
@@ -104,14 +187,14 @@ router.get('/:ticketId', auth, async (req, res) => {
       JOIN users u ON r.user_id = u.id
       WHERE r.ticket_id = ?
       ORDER BY r.created_at ASC
-    `).all(req.params.ticketId);
+    `).all(ticketId);
 
     res.json({
       ticket,
       responses
     });
   } catch (error) {
-    console.error('Error:', error);
+    console.error('Error fetching ticket details:', error);
     res.status(500).json({ 
       message: 'Failed to fetch ticket details',
       error: error.message 

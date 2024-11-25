@@ -3,6 +3,17 @@ const router = express.Router();
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('../db');
+const { JWT_SECRET } = require('../config/jwt');
+
+// Add this at the top of your auth.js routes file
+router.use((req, res, next) => {
+  console.log('Auth route accessed:', {
+    method: req.method,
+    path: req.path,
+    body: req.body
+  });
+  next();
+});
 
 // Register
 router.post('/register', async (req, res) => {
@@ -37,7 +48,7 @@ router.post('/register', async (req, res) => {
     // Generate JWT
     const token = jwt.sign(
       { userId: result.lastInsertRowid },
-      process.env.JWT_SECRET || 'your-secret-key',
+      JWT_SECRET,
       { expiresIn: '24h' }
     );
 
@@ -71,12 +82,30 @@ router.post('/login', async (req, res) => {
       return res.status(400).json({ message: 'Invalid credentials' });
     }
 
+    // Add debugging
+    console.log('Creating token with:', {
+      userId: user.id,
+      secret: JWT_SECRET.substring(0, 4) + '...',
+      secretLength: JWT_SECRET.length
+    });
+
     // Generate JWT
     const token = jwt.sign(
-      { userId: user.id },
-      process.env.JWT_SECRET || 'your-secret-key',
+      { 
+        userId: user.id,  // Make sure this matches the column name in your users table
+        email: user.email 
+      },
+      process.env.JWT_SECRET,
       { expiresIn: '24h' }
     );
+
+    // Verify token immediately after creation
+    try {
+      const decoded = jwt.verify(token, JWT_SECRET);
+      console.log('Token verified successfully:', decoded);
+    } catch (verifyError) {
+      console.error('Token verification failed:', verifyError);
+    }
 
     res.json({
       message: 'Login successful',
@@ -85,8 +114,32 @@ router.post('/login', async (req, res) => {
       userId: user.id
     });
   } catch (error) {
-    console.error(error);
+    console.error('Login error:', error);
     res.status(500).json({ message: 'Server error' });
+  }
+});
+
+// Add this route to verify tokens
+router.post('/verify-token', async (req, res) => {
+  try {
+    const { token } = req.body;
+    
+    console.log('Verifying token with secret:', JWT_SECRET.substring(0, 4) + '...');
+    
+    const decoded = jwt.verify(token, JWT_SECRET);
+    
+    const user = db.prepare('SELECT id, role FROM users WHERE id = ?').get(decoded.userId);
+    
+    res.json({
+      valid: true,
+      decoded,
+      user: user ? { id: user.id, role: user.role } : null
+    });
+  } catch (error) {
+    res.status(401).json({
+      valid: false,
+      error: error.message
+    });
   }
 });
 

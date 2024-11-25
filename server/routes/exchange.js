@@ -1,214 +1,266 @@
 const express = require('express');
 const router = express.Router();
-const QRCode = require('qrcode');
-const auth = require('../middleware/auth');
-const isAdmin = require('../middleware/isAdmin');
 const db = require('../db');
-const { sendCrypto } = require('../services/bitgo');
+const auth = require('../middleware/auth');
+const cryptoService = require('../services/blockcypher');
+const webReceiptVerifier = require('../services/webReceiptVerification');
+const emailVerifier = require('../services/emailVerification');
 
-const getFeePercentage = () => {
+// Get fee rate for a specific amount and crypto type
+router.get('/fee-rate', (req, res) => {
   try {
-    const setting = db.prepare('SELECT value FROM settings WHERE key = ?').get('feePercentage');
-    return setting ? parseFloat(setting.value) : 22; // fallback to 22 if not set
-  } catch (error) {
-    console.error('Error fetching fee percentage:', error);
-    return 22; // fallback to default
-  }
-};
+    const { amount, cryptoType } = req.query;
+    const numericAmount = parseFloat(amount);
 
+    const feeRule = db.prepare(`
+      SELECT fee_percentage 
+      FROM fee_rules 
+      WHERE crypto_type = ? 
+      AND price_range_start <= ? 
+      AND price_range_end >= ?
+    `).get(cryptoType, numericAmount, numericAmount);
+
+    // If no rule matches, return a default fee percentage
+    const feePercentage = feeRule ? feeRule.fee_percentage : 22;
+
+    res.json({ feePercentage });
+  } catch (error) {
+    console.error('Error getting fee rate:', error);
+    res.status(500).json({ error: 'Failed to get fee rate' });
+  }
+});
+
+// Create new exchange transaction
 router.post('/create', auth, async (req, res) => {
   try {
     const { cashAppAmount, cryptoType, walletAddress, priceAtSubmission } = req.body;
     
-    // More detailed debug logging
-    console.log('Exchange request details:', {
-      userId: req.user.userId,
-      body: req.body,
-      headers: req.headers
-    });
-
-    // Validate inputs
-    if (!cashAppAmount || !cryptoType || !walletAddress || !priceAtSubmission) {
-      return res.status(400).json({ 
-        message: 'Missing required fields',
-        received: { cashAppAmount, cryptoType, walletAddress, priceAtSubmission }
+    if (!req.user || !req.user.userId) {
+      return res.status(401).json({
+        success: false,
+        message: 'User not authenticated'
       });
     }
 
-    // Get dynamic fee percentage from settings
-    const feePercentage = getFeePercentage();
+    const userId = req.user.userId;
+    const FEE_PERCENTAGE = 22;
     
-    // Calculate fees using dynamic percentage
-    const amount = parseFloat(cashAppAmount);
-    const price = parseFloat(priceAtSubmission);
-    const feeAmount = (amount * feePercentage) / 100;
-    const netAmount = amount - feeAmount;
-    const cryptoAmountAfterFees = (netAmount / price).toFixed(8);
+    // Calculate amounts
+    const netAmount = cashAppAmount / 1.22;
+    const cryptoAmount = netAmount / priceAtSubmission;
+    const feeAmount = cashAppAmount - netAmount;
 
-    // Generate transaction ID
-    const transactionId = `TX-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    // Get next transaction ID
+    const maxIdResult = db.prepare('SELECT MAX(transaction_id) as max_id FROM transactions').get();
+    const nextTransactionId = (maxIdResult.max_id || 0) + 1;
 
-    try {
-      // Generate QR code
-      const qrCodeUrl = await QRCode.toDataURL(
-        `cashapp://payment?amount=${amount}&transaction_id=${transactionId}`
-      );
+    // Create transaction record
+    const result = db.prepare(`
+      INSERT INTO transactions (
+        transaction_id,
+        user_id,
+        amount_usd,
+        amount_crypto,
+        crypto_type,
+        wallet_address,
+        status,
+        exchange_rate,
+        fee_amount,
+        fee_percentage,
+        created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+    `).run(
+      nextTransactionId,
+      userId,
+      cashAppAmount,
+      cryptoAmount,
+      cryptoType,
+      walletAddress,
+      'pending',
+      priceAtSubmission,
+      feeAmount,
+      FEE_PERCENTAGE
+    );
 
-      // Store transaction in database
-      db.transaction(() => {
-        // Insert the transaction
-        db.prepare(`
-          INSERT INTO transactions (
-            user_id, amount_usd, amount_crypto, crypto_type,
-            wallet_address, exchange_rate, transaction_id, status,
-            fee_percentage, fee_amount
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        `).run(
-          req.user.userId,
-          amount,
-          cryptoAmountAfterFees,
-          cryptoType,
-          walletAddress,
-          price,
-          transactionId,
-          'pending',
-          feePercentage,
-          feeAmount
-        );
+    // Get the created transaction
+    const transaction = db.prepare(`
+      SELECT * FROM transactions WHERE transaction_id = ?
+    `).get(nextTransactionId);
 
-        // Update or insert crypto stats
-        db.prepare(`
-          INSERT INTO user_crypto_stats (user_id, crypto_type, transaction_count, total_amount_usd, total_amount_crypto)
-          VALUES (?, ?, 1, ?, ?)
-          ON CONFLICT(user_id, crypto_type) DO UPDATE SET
-            transaction_count = transaction_count + 1,
-            total_amount_usd = total_amount_usd + ?,
-            total_amount_crypto = total_amount_crypto + ?
-        `).run(
-          req.user.userId,
-          cryptoType,
-          amount,
-          cryptoAmountAfterFees,
-          amount,
-          cryptoAmountAfterFees
-        );
-      })();
-
-      // Send response
-      res.json({
-        transactionId,
-        qrCodeUrl,
-        feeAmount: feeAmount.toFixed(2),
-        netAmount: netAmount.toFixed(2),
-        cryptoAmountAfterFees
-      });
-
-    } catch (dbError) {
-      console.error('Database or QR Code error:', dbError);
-      res.status(500).json({ 
-        message: 'Failed to process exchange',
-        error: dbError.message 
-      });
-    }
+    return res.json({
+      success: true,
+      transaction: {
+        id: transaction.transaction_id,
+        amount_usd: transaction.amount_usd,
+        amount_crypto: transaction.amount_crypto,
+        crypto_type: transaction.crypto_type,
+        status: transaction.status,
+        exchange_rate: transaction.exchange_rate,
+        fee_amount: transaction.fee_amount,
+        fee_percentage: transaction.fee_percentage
+      }
+    });
 
   } catch (error) {
-    // Detailed error logging
-    console.error('Exchange creation failed:', {
-      error: error.message,
-      stack: error.stack,
-      userId: req.user?.userId,
-      requestBody: req.body
-    });
-    res.status(500).json({ 
-      message: 'Failed to process exchange',
-      error: error.message 
+    console.error('Exchange creation error:', error);
+    return res.status(500).json({
+      success: false,
+      message: 'Failed to create exchange',
+      error: error.message
     });
   }
 });
 
-router.post('/verify', auth, async (req, res) => {
-  try {
-    const { transactionId } = req.body;
+// Verify and complete transaction
+router.post('/verify-and-complete', auth, async (req, res) => {
+  const { transactionId, receipt, identifier, amount, fromUsername } = req.body;
 
-    // Get transaction details from database
+  try {
+    // Get transaction first
     const transaction = db.prepare(`
-      SELECT t.*, u.id as user_id 
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE t.transaction_id = ? AND t.status = 'pending'
+      SELECT * FROM transactions 
+      WHERE transaction_id = ? AND status = 'pending'
     `).get(transactionId);
 
     if (!transaction) {
-      return res.status(404).json({ message: 'Transaction not found or already processed' });
-    }
-
-    try {
-      // Send crypto using BitGo
-      const bitgoTx = await sendCrypto(
-        transaction.crypto_type,
-        transaction.wallet_address,
-        transaction.amount_crypto
-      );
-
-      // Begin transaction to update both transaction status and user total
-      db.transaction(() => {
-        // Update transaction status
-        db.prepare(`
-          UPDATE transactions 
-          SET 
-            status = 'completed',
-            completed_at = CURRENT_TIMESTAMP,
-            tx_hash = ?
-          WHERE transaction_id = ?
-        `).run(bitgoTx.txid, transactionId);
-
-        // Update user's total_exchanged
-        db.prepare(`
-          UPDATE users 
-          SET total_exchanged = total_exchanged + ?
-          WHERE id = ?
-        `).run(transaction.amount_usd, transaction.user_id);
-      })();
-
-      res.json({ 
-        message: 'Transaction completed successfully',
-        txHash: bitgoTx.txid
+      return res.status(404).json({
+        success: false,
+        step: 'transaction_check',
+        message: 'Transaction not found or already completed'
       });
-    } catch (bitgoError) {
-      console.error('BitGo transaction failed:', bitgoError);
-      
-      // Update transaction status to failed
-      db.prepare(`
-        UPDATE transactions 
-        SET status = 'failed'
-        WHERE transaction_id = ?
-      `).run(transactionId);
-
-      throw new Error('Failed to send cryptocurrency');
     }
-  } catch (error) {
-    console.error('Verification error:', error);
-    res.status(500).json({ 
-      message: 'Failed to verify transaction',
-      error: error.message 
+
+    // Step 1: Web Receipt Verification
+    console.log('Starting web receipt verification for transaction:', transactionId);
+    let webVerification = null;
+    try {
+      webVerification = await webReceiptVerifier.verifyReceipt(receipt);
+      console.log('Web verification successful:', webVerification);
+    } catch (webError) {
+      console.error('Web verification failed:', webError);
+      return res.status(400).json({
+        success: false,
+        step: 'web_verification',
+        message: 'Could not verify web receipt',
+        error: webError.message
+      });
+    }
+
+    // Step 2: Email Verification
+    console.log('Starting email verification with identifier:', webVerification.identifier);
+    const emailResults = await emailVerifier.findPaymentEmail(
+      webVerification.identifier,
+      amount,
+      fromUsername
+    );
+
+    if (!emailResults || emailResults.length === 0) {
+      console.error('No matching email found for identifier:', webVerification.identifier);
+      return res.status(400).json({
+        success: false,
+        step: 'email_verification',
+        message: 'No matching payment found in emails'
+      });
+    }
+
+    // Step 3: Cross-verify details
+    const matchingEmail = emailResults.find(email => 
+      email.verified && 
+      email.identifier === webVerification.identifier &&
+      Math.abs(email.amount - parseFloat(amount)) < 0.01 // Account for floating point
+    );
+
+    if (!matchingEmail) {
+      console.error('Email verification failed:', {
+        expectedAmount: amount,
+        foundAmount: emailResults[0]?.amount,
+        identifier: webVerification.identifier
+      });
+      return res.status(400).json({
+        success: false,
+        step: 'cross_verification',
+        message: 'Payment details do not match'
+      });
+    }
+
+    // Step 4: Verify payment timing
+    const paymentTime = new Date(matchingEmail.timestamp);
+    const timeDiff = Date.now() - paymentTime.getTime();
+    if (timeDiff > 30 * 60 * 1000) { // 30 minutes
+      return res.status(400).json({
+        success: false,
+        step: 'time_verification',
+        message: 'Payment is too old (must be within 30 minutes)'
+      });
+    }
+
+    // Step 5: Update transaction status
+    db.prepare(`
+      UPDATE transactions 
+      SET 
+        status = 'verified',
+        verified_at = CURRENT_TIMESTAMP,
+        receipt_identifier = ?,
+        verification_method = 'dual_verification'
+      WHERE transaction_id = ?
+    `).run(webVerification.identifier, transactionId);
+
+    // Step 6: Check wallet balance before proceeding
+    const walletBalance = await cryptoService.getBalance(process.env.BTC_WALLET_ADDRESS);
+    if (walletBalance.balance < transaction.amount_crypto) {
+      return res.status(400).json({
+        success: false,
+        step: 'balance_check',
+        message: 'Insufficient funds in exchange wallet'
+      });
+    }
+
+    // Step 7: Send crypto
+    const sendResult = await cryptoService.sendBTC(
+      transaction.wallet_address,
+      transaction.amount_crypto
+    );
+
+    // Step 8: Update transaction to completed
+    db.prepare(`
+      UPDATE transactions 
+      SET 
+        status = 'completed',
+        completed_at = CURRENT_TIMESTAMP,
+        tx_hash = ?
+      WHERE transaction_id = ?
+    `).run(sendResult.txid, transactionId);
+
+    // Success response with full details
+    return res.json({
+      success: true,
+      message: 'Transaction verified and completed',
+      details: {
+        transactionId,
+        verificationMethod: 'dual_verification',
+        webReceipt: {
+          verified: true,
+          identifier: webVerification.identifier
+        },
+        emailVerification: {
+          verified: true,
+          timestamp: matchingEmail.timestamp
+        },
+        crypto: {
+          txHash: sendResult.txid,
+          amount: transaction.amount_crypto
+        }
+      }
     });
-  }
-});
 
-router.post('/transactions/:transactionId/confirm', auth, isAdmin, async (req, res) => {
-  try {
-    // ... existing confirmation logic ...
-
-    // Broadcast the update
-    global.broadcastUpdate({
-      type: 'TRANSACTION_STATUS_CHANGE',
-      transactionId: req.params.transactionId,
-      status: 'completed'
-    });
-
-    res.json({ message: 'Transaction confirmed successfully' });
   } catch (error) {
-    // ... error handling ...
+    console.error('Verification process failed:', error);
+    return res.status(500).json({
+      success: false,
+      step: 'system_error',
+      message: 'System error during verification',
+      error: error.message
+    });
   }
 });
 

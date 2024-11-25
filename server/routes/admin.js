@@ -3,6 +3,7 @@ const router = express.Router();
 const db = require('../db');
 const auth = require('../middleware/auth');
 const isAdmin = require('../middleware/isAdmin');
+const { getWalletBalances } = require('../services/wallet');
 
 // Get all users
 router.get('/users', auth, isAdmin, (req, res) => {
@@ -21,19 +22,20 @@ router.get('/users', auth, isAdmin, (req, res) => {
 // Get admin stats
 router.get('/stats', auth, isAdmin, (req, res) => {
   try {
-    const stats = db.prepare(`
+    const basicStats = db.prepare(`
       SELECT 
         (SELECT COUNT(*) FROM users) as totalUsers,
-        (SELECT COUNT(*) FROM transactions) as totalTransactions,
+        (SELECT COUNT(*) FROM transactions WHERE status = 'completed') as totalTransactions,
         (SELECT COALESCE(SUM(amount_usd), 0) 
          FROM transactions 
-         WHERE status = 'completed') as totalVolume
+         WHERE status = 'completed'
+         AND amount_usd > 0) as totalVolume
     `).get();
 
     res.json({
-      totalUsers: stats.totalUsers,
-      totalTransactions: stats.totalTransactions,
-      totalVolume: stats.totalVolume
+      totalUsers: basicStats.totalUsers,
+      totalTransactions: basicStats.totalTransactions,
+      totalVolume: basicStats.totalVolume
     });
   } catch (error) {
     console.error('Error fetching admin stats:', error);
@@ -68,9 +70,8 @@ router.get('/settings', auth, isAdmin, (req, res) => {
 // Update admin settings
 router.put('/settings', auth, isAdmin, (req, res) => {
   try {
-    const { feePercentage, cashappUsername } = req.body;
+    const { feePercentage } = req.body;
 
-    // Begin transaction
     const updateSetting = db.prepare(`
       INSERT OR REPLACE INTO settings (key, value)
       VALUES (?, ?)
@@ -79,9 +80,6 @@ router.put('/settings', auth, isAdmin, (req, res) => {
     db.transaction(() => {
       if (feePercentage !== undefined) {
         updateSetting.run('feePercentage', feePercentage.toString());
-      }
-      if (cashappUsername !== undefined) {
-        updateSetting.run('cashappUsername', cashappUsername);
       }
     })();
 
@@ -252,155 +250,273 @@ router.put('/users/:userId/role', auth, isAdmin, (req, res) => {
 // Get extended admin stats
 router.get('/extended-stats', auth, isAdmin, async (req, res) => {
   try {
-    // Basic stats
-    const basicStats = db.prepare(`
+    // Get current stats
+    const currentStats = db.prepare(`
+      WITH recent_transactions AS (
+        SELECT 
+          *,
+          ROUND((julianday('now') - julianday(created_at)) * 24 * 60, 2) as response_time_mins
+        FROM transactions 
+        WHERE created_at > datetime('now', '-24 hours')
+      )
       SELECT 
-        (SELECT COUNT(*) FROM users) as totalUsers,
-        (SELECT COUNT(*) FROM transactions WHERE status = 'completed') as totalTransactions,
-        (SELECT COALESCE(SUM(amount_usd), 0) 
-         FROM transactions 
-         WHERE status = 'completed'
-         AND amount_usd > 0) as totalVolume
-    `).get();
+        COUNT(DISTINCT user_id) as daily_active_users,
+        COUNT(*) as total_transactions,
+        ROUND(AVG(amount_usd), 2) as avg_transaction_size,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_transactions,
+        ROUND(AVG(CASE WHEN status = 'completed' THEN response_time_mins END), 2) as avg_response_time,
+        ROUND((COUNT(CASE WHEN status = 'completed' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0)), 2) as success_rate,
+        COALESCE(SUM(amount_usd), 0) as total_volume
+      FROM recent_transactions
+    `).get() || {
+      daily_active_users: 0,
+      total_transactions: 0,
+      avg_transaction_size: 0,
+      pending_transactions: 0,
+      avg_response_time: 0,
+      success_rate: 0,
+      total_volume: 0
+    };
 
-    // Daily active users
-    const dailyActiveUsers = db.prepare(`
-      SELECT COUNT(DISTINCT user_id) as count 
-      FROM transactions 
-      WHERE created_at > datetime('now', '-1 day')
-    `).get();
+    // Get previous stats
+    const previousStats = db.prepare(`
+      WITH prev_transactions AS (
+        SELECT 
+          *,
+          ROUND((julianday('now', '-24 hours') - julianday(created_at)) * 24 * 60, 2) as response_time_mins
+        FROM transactions 
+        WHERE created_at BETWEEN datetime('now', '-48 hours') AND datetime('now', '-24 hours')
+      )
+      SELECT 
+        COUNT(DISTINCT user_id) as daily_active_users,
+        COUNT(*) as total_transactions,
+        ROUND(AVG(amount_usd), 2) as avg_transaction_size,
+        COUNT(CASE WHEN status = 'pending' THEN 1 END) as pending_transactions,
+        ROUND(AVG(CASE WHEN status = 'completed' THEN response_time_mins END), 2) as avg_response_time,
+        ROUND((COUNT(CASE WHEN status = 'completed' THEN 1 END) * 100.0 / NULLIF(COUNT(*), 0)), 2) as success_rate,
+        COALESCE(SUM(amount_usd), 0) as total_volume
+      FROM prev_transactions
+    `).get() || {
+      daily_active_users: 0,
+      total_transactions: 0,
+      avg_transaction_size: 0,
+      pending_transactions: 0,
+      avg_response_time: 0,
+      success_rate: 0,
+      total_volume: 0
+    };
 
-    const previousDayUsers = db.prepare(`
-      SELECT COUNT(DISTINCT user_id) as count 
-      FROM transactions 
-      WHERE created_at BETWEEN datetime('now', '-2 days') AND datetime('now', '-1 day')
-    `).get();
+    // Calculate percentage changes with null safety
+    const calculateChange = (current, previous) => {
+      if (!previous || previous === 0) return '0';
+      return ((current - previous) / previous * 100).toFixed(1);
+    };
 
-    // Calculate daily change percentage
-    const dailyChange = previousDayUsers.count > 0 
-      ? ((dailyActiveUsers.count - previousDayUsers.count) / previousDayUsers.count * 100)
-      : 0;
-
-    // Get new users today
+    // Get current online users count
+    const currentOnline = req.app.get('wsServer')?.getOnlineCount() || 0;
+    
+    // Get new users today with null safety
     const newUsersToday = db.prepare(`
       SELECT COUNT(*) as count
-      FROM users
-      WHERE created_at > datetime('now', 'start of day')
-    `).get();
+      FROM users 
+      WHERE created_at > date('now')
+    `).get()?.count || 0;
 
-    // Get repeat users (users with more than one transaction)
-    const repeatUsers = db.prepare(`
-      SELECT 
-        COUNT(DISTINCT user_id) * 100.0 / (SELECT COUNT(*) FROM users) as percentage
-      FROM transactions
-      GROUP BY user_id
-      HAVING COUNT(*) > 1
-    `).get();
-
-    // Get last hour transactions
-    const lastHourTransactions = db.prepare(`
+    // Get new users yesterday with null safety
+    const newUsersYesterday = db.prepare(`
       SELECT COUNT(*) as count
-      FROM transactions
+      FROM users 
+      WHERE created_at BETWEEN date('now', '-1 day') AND date('now')
+    `).get()?.count || 0;
+
+    // Get last hour transactions with null safety
+    const lastHourStats = db.prepare(`
+      SELECT COUNT(*) as count, COALESCE(SUM(amount_usd), 0) as volume
+      FROM transactions 
       WHERE created_at > datetime('now', '-1 hour')
-    `).get();
+    `).get() || { count: 0, volume: 0 };
 
-    // Calculate average transaction size
-    const avgTransactionSize = db.prepare(`
-      SELECT COALESCE(AVG(amount_usd), 0) as average
-      FROM transactions
-      WHERE status = 'completed'
-      AND amount_usd > 0
-    `).get();
+    // Get previous hour transactions with null safety
+    const prevHourStats = db.prepare(`
+      SELECT COUNT(*) as count, COALESCE(SUM(amount_usd), 0) as volume
+      FROM transactions 
+      WHERE created_at BETWEEN datetime('now', '-2 hours') AND datetime('now', '-1 hour')
+    `).get() || { count: 0, volume: 0 };
 
-    // Get peak hour volume
-    const peakHourVolume = db.prepare(`
-      SELECT COALESCE(MAX(hourly_volume), 0) as volume
-      FROM (
-        SELECT SUM(amount_usd) as hourly_volume
-        FROM transactions
-        WHERE status = 'completed'
-        AND created_at > datetime('now', '-24 hours')
-        AND amount_usd > 0
-        GROUP BY strftime('%H', created_at)
-      )
-    `).get();
+    // Get wallet balances with null safety
+    const walletBalances = await getWalletBalances() || {};
 
-    // Get crypto distribution
-    const cryptoDistribution = db.prepare(`
-      SELECT 
-        crypto_type,
-        COUNT(*) * 100.0 / (
-          SELECT COUNT(*) 
-          FROM transactions 
-          WHERE status = 'completed'
-        ) as percentage
-      FROM transactions
-      WHERE status = 'completed'
-      GROUP BY crypto_type
-      ORDER BY COUNT(*) DESC
-      LIMIT 3
-    `).all();
-
-    // Get recent activity
-    const recentActivity = db.prepare(`
-      SELECT 
-        t.id,
-        t.amount_usd,
-        t.amount_crypto,
-        t.crypto_type,
-        t.created_at,
-        t.status,
-        u.username,
-        t.wallet_address
-      FROM transactions t
-      JOIN users u ON t.user_id = u.id
-      WHERE t.created_at > datetime('now', '-24 hours')
-      ORDER BY t.created_at DESC
-      LIMIT 10
-    `).all();
-
-    // Format response
+    // Format the response
     const response = {
-      // Main stats
-      totalUsers: basicStats.totalUsers,
-      totalTransactions: basicStats.totalTransactions,
-      totalVolume: basicStats.totalVolume,
-      
-      // Detailed stats
       dailyActiveUsers: {
-        value: dailyActiveUsers.count,
-        change: dailyChange.toFixed(1)
+        value: currentStats.daily_active_users || 0,
+        change: calculateChange(currentStats.daily_active_users, previousStats.daily_active_users)
       },
-      newUsersToday: newUsersToday.count,
-      repeatUsers: repeatUsers?.percentage?.toFixed(1) || 0,
-      lastHourTransactions: lastHourTransactions.count,
-      averageTransactionSize: avgTransactionSize.average?.toFixed(2) || 0,
-      peakHourVolume: peakHourVolume?.volume?.toFixed(2) || 0,
-      
-      // Crypto distribution
-      topCryptos: cryptoDistribution.map(crypto => ({
-        name: crypto.crypto_type,
-        percentage: parseFloat(crypto.percentage.toFixed(1))
-      })),
-      
-      // Recent activity with more details
-      recentActivity: recentActivity.map(activity => ({
-        id: activity.id,
-        type: 'exchange',
-        amount: activity.amount_usd,
-        cryptoAmount: activity.amount_crypto,
-        crypto: activity.crypto_type,
-        time: activity.created_at,
-        username: activity.username,
-        status: activity.status,
-        walletAddress: activity.wallet_address?.slice(0, 8) + '...' // Truncate for privacy
-      }))
+      currentOnline: {
+        value: currentOnline,
+        change: '0'
+      },
+      successRate: {
+        value: currentStats.success_rate || 0,
+        change: calculateChange(currentStats.success_rate, previousStats.success_rate)
+      },
+      pendingTransactions: {
+        value: currentStats.pending_transactions || 0,
+        change: calculateChange(currentStats.pending_transactions, previousStats.pending_transactions)
+      },
+      lastHourTransactions: {
+        value: lastHourStats.count || 0,
+        change: calculateChange(lastHourStats.count, prevHourStats.count)
+      },
+      averageTransactionSize: {
+        value: currentStats.avg_transaction_size || 0,
+        change: calculateChange(currentStats.avg_transaction_size, previousStats.avg_transaction_size)
+      },
+      averageResponseTime: {
+        value: currentStats.avg_response_time || 0,
+        change: calculateChange(currentStats.avg_response_time, previousStats.avg_response_time)
+      },
+      newUsersToday: {
+        value: newUsersToday,
+        change: calculateChange(newUsersToday, newUsersYesterday)
+      },
+      walletBalances
     };
 
     res.json(response);
   } catch (error) {
     console.error('Error in extended stats:', error);
-    res.status(500).json({ message: 'Server error', error: error.message });
+    res.status(500).json({ 
+      message: 'Server error', 
+      error: error.message 
+    });
+  }
+});
+
+// Add this new route to handle exchange toggling
+router.post('/toggle-exchange', auth, isAdmin, (req, res) => {
+  try {
+    // Get current exchange status
+    const currentStatus = db.prepare(`
+      SELECT value FROM settings WHERE key = 'exchangeEnabled'
+    `).get();
+
+    // Toggle the status (if not exists, create as enabled)
+    const newStatus = currentStatus?.value === 'true' ? 'false' : 'true';
+
+    // Update or insert the setting
+    db.prepare(`
+      INSERT OR REPLACE INTO settings (key, value)
+      VALUES ('exchangeEnabled', ?)
+    `).run(newStatus);
+
+    // Broadcast the status change to all connected clients
+    if (global.broadcastUpdate) {
+      global.broadcastUpdate({
+        type: 'EXCHANGE_STATUS',
+        status: newStatus === 'true'
+      });
+    }
+
+    res.json({ 
+      success: true, 
+      enabled: newStatus === 'true'
+    });
+  } catch (error) {
+    console.error('Error toggling exchange:', error);
+    res.status(500).json({ 
+      message: 'Failed to toggle exchange status',
+      error: error.message 
+    });
+  }
+});
+
+// Add this GET route to check exchange status
+router.get('/exchange-status', auth, isAdmin, (req, res) => {
+  try {
+    const status = db.prepare(`
+      SELECT value FROM settings WHERE key = 'exchangeEnabled'
+    `).get();
+
+    res.json({ 
+      enabled: status?.value === 'true' 
+    });
+  } catch (error) {
+    console.error('Error getting exchange status:', error);
+    res.status(500).json({ 
+      message: 'Failed to get exchange status',
+      error: error.message 
+    });
+  }
+});
+
+router.post('/fee-rules', auth, isAdmin, (req, res) => {
+    const { crypto_type, price_range_start, price_range_end, fee_percentage } = req.body;
+
+    try {
+        db.prepare(`
+            INSERT INTO fee_rules (crypto_type, price_range_start, price_range_end, fee_percentage)
+            VALUES (?, ?, ?, ?)
+        `).run(crypto_type, price_range_start, price_range_end, fee_percentage);
+
+        res.status(201).json({ message: 'Fee rule added successfully' });
+    } catch (error) {
+        console.error('Error adding fee rule:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+router.get('/fee-rules', auth, isAdmin, (req, res) => {
+    try {
+        const rules = db.prepare(`
+            SELECT * FROM fee_rules
+            ORDER BY crypto_type, price_range_start
+        `).all();
+
+        res.json(rules);
+    } catch (error) {
+        console.error('Error fetching fee rules:', error);
+        res.status(500).json({ message: 'Server error' });
+    }
+});
+
+// Update settings
+router.post('/settings', auth, async (req, res) => {
+  try {
+    // Check if user is admin or owner
+    if (!['admin', 'owner'].includes(req.user.role)) {
+      return res.status(403).json({ 
+        message: 'Unauthorized to modify settings' 
+      });
+    }
+
+    const { key, value } = req.body;
+
+    // Validate input
+    if (!key || value === undefined) {
+      return res.status(400).json({ 
+        message: 'Key and value are required' 
+      });
+    }
+
+    // Update or insert the setting
+    db.prepare(`
+      INSERT OR REPLACE INTO settings (key, value, updated_at)
+      VALUES (?, ?, CURRENT_TIMESTAMP)
+    `).run(key, value);
+
+    res.json({ 
+      message: 'Setting updated successfully',
+      key,
+      value 
+    });
+
+  } catch (error) {
+    console.error('Error updating settings:', error);
+    res.status(500).json({ 
+      message: 'Failed to update settings',
+      error: error.message 
+    });
   }
 });
 

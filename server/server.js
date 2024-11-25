@@ -10,6 +10,11 @@ const adminRoutes = require('./routes/admin');
 const ticketRoutes = require('./routes/tickets');
 require('dotenv').config();
 const jwt = require('jsonwebtoken');
+const auth = require('./middleware/auth');
+const WebSocket = require('ws');
+const { JWT_SECRET } = require('./config/jwt');
+const path = require('path');
+const axios = require('axios');
 
 const app = express();
 const server = http.createServer(app);
@@ -23,6 +28,8 @@ const wss = new WebSocketServer({
 
 // Store authenticated clients with their user info
 const clients = new Map();
+
+console.log(process.env.JWT_SECRET)
 
 wss.on('connection', (ws) => {
   console.log('New WebSocket connection established');
@@ -89,26 +96,103 @@ global.broadcastUpdate = broadcast;
 
 // Middleware
 app.use(cors({
-  origin: '*',
-  methods: ['GET', 'POST', 'PUT', 'DELETE'],
-  allowedHeaders: ['Content-Type', 'Authorization']
+  origin: ['http://localhost:3000', 'http://localhost:3001'],
+  credentials: true
 }));
 app.use(express.json());
 
 // Debug middleware to log requests
 app.use((req, res, next) => {
-  console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
-  console.log('Headers:', req.headers);
+  console.log(`${req.method} ${req.path}`);
+  next();
+});
+
+// Add after your other middleware, before routes
+app.use(express.static(path.join(__dirname, '../public')));
+
+// Add this before your routes
+app.use((req, res, next) => {
+  console.log(`${new Date().toISOString()} - ${req.method} ${req.originalUrl}`);
+  console.log('Request body:', req.body);
   next();
 });
 
 // Routes
-app.use('/api/auth', authRoutes);
+app.use('/api/auth', (req, res, next) => {
+  console.log('Auth route accessed:', req.path);
+  next();
+}, authRoutes);
 app.use('/api/profile', profileRoutes);
 app.use('/api/crypto', cryptoRoutes);
 app.use('/api/exchange', exchangeRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/tickets', ticketRoutes);
+
+// Test routes for JWT verification
+app.get('/api/test/jwt', (req, res) => {
+  try {
+    // Create a test token with userId
+    const testToken = jwt.sign(
+      { 
+        userId: 1,  // Make sure this user exists in your database
+        test: 'data',
+        timestamp: Date.now() 
+      },
+      JWT_SECRET,
+      { expiresIn: '1h' }
+    );
+    
+    // Log the current JWT secret
+    console.log('Current JWT_SECRET:', JWT_SECRET);
+    
+    // Try to verify the token immediately
+    const decoded = jwt.verify(testToken, JWT_SECRET);
+    
+    // Send detailed response
+    res.json({
+      success: true,
+      message: 'JWT configuration is working',
+      testToken,
+      decoded,
+      secretFirstChars: JWT_SECRET.substring(0, 4) + '...',
+      test: {
+        tokenCreated: true,
+        tokenVerified: true,
+        tokenLength: testToken.length,
+        decodedData: decoded
+      }
+    });
+  } catch (error) {
+    // Send detailed error response
+    console.error('JWT Test Error:', error);
+    res.status(500).json({
+      success: false,
+      error: error.message,
+      errorType: error.name,
+      secretLoaded: !!JWT_SECRET,
+      secretFirstChars: JWT_SECRET ? (JWT_SECRET.substring(0, 4) + '...') : 'not loaded',
+      debug: {
+        secretExists: !!JWT_SECRET,
+        secretType: typeof JWT_SECRET,
+        secretLength: JWT_SECRET ? JWT_SECRET.length : 0
+      }
+    });
+  }
+});
+
+// Add a protected test route
+app.get('/api/test/protected', auth, (req, res) => {
+  res.json({
+    success: true,
+    message: 'You accessed a protected route',
+    user: req.user
+  });
+});
+
+// Add a catch-all route for React app
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../public/index.html'));
+});
 
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
@@ -122,4 +206,4 @@ server.listen(PORT, () => {
 // Add error handling for the server
 server.on('error', (error) => {
   console.error('Server error:', error);
-}); 
+});

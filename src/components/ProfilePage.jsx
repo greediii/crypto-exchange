@@ -144,7 +144,7 @@ const ProfilePage = ({ onExchangeClick, userRole, onAdminClick }) => {
             <IconButton
               icon={<FaExchangeAlt />}
               onClick={onExchangeClick}
-              colorScheme="blue"
+              colorScheme="green"
               variant="ghost"
               aria-label="Go to Exchange"
             />
@@ -301,34 +301,37 @@ const ProfilePage = ({ onExchangeClick, userRole, onAdminClick }) => {
                   <HStack spacing={3}>
                     <Icon 
                       as={
-                        calculateMostUsedCrypto(transactions).crypto === 'BTC' ? FaBitcoin :
-                        calculateMostUsedCrypto(transactions).crypto === 'ETH' ? FaEthereum :
-                        SiLitecoin
+                        mostUsedCrypto.crypto === 'BTC' ? FaBitcoin :
+                        mostUsedCrypto.crypto === 'ETH' ? FaEthereum :
+                        mostUsedCrypto.crypto === 'LTC' ? SiLitecoin :
+                        FaQuestionCircle  // Default icon for "None"
                       }
                       color={
-                        calculateMostUsedCrypto(transactions).crypto === 'BTC' ? '#F7931A' :
-                        calculateMostUsedCrypto(transactions).crypto === 'ETH' ? '#627EEA' :
-                        '#345D9D'
+                        mostUsedCrypto.crypto === 'BTC' ? '#F7931A' :
+                        mostUsedCrypto.crypto === 'ETH' ? '#627EEA' :
+                        mostUsedCrypto.crypto === 'LTC' ? '#345D9D' :
+                        'gray.400'  // Default color for "None"
                       }
                       boxSize={7}
                     />
                     <Text color="white" fontSize="xl" fontWeight="medium">
-                      {calculateMostUsedCrypto(transactions).crypto}
+                      {mostUsedCrypto.crypto}
                     </Text>
                   </HStack>
                 </Center>
 
                 <Box>
                   <Text color="gray.400" fontSize="sm" mb={2}>
-                    {calculateMostUsedCrypto(transactions).count} Transactions
+                    {mostUsedCrypto.count} Transactions
                   </Text>
                   <Progress 
-                    value={80} 
+                    value={mostUsedCrypto.crypto === 'None' ? 0 : 80} 
                     sx={{
                       '& > div': {
-                        background: calculateMostUsedCrypto(transactions).crypto === 'BTC' ? '#F7931A' :
-                                   calculateMostUsedCrypto(transactions).crypto === 'ETH' ? '#627EEA' :
-                                   '#345D9D'
+                        background: mostUsedCrypto.crypto === 'BTC' ? '#F7931A' :
+                                   mostUsedCrypto.crypto === 'ETH' ? '#627EEA' :
+                                   mostUsedCrypto.crypto === 'LTC' ? '#345D9D' :
+                                   'gray.400'  // Default color for "None"
                       },
                       bg: 'rgba(255, 255, 255, 0.1)'
                     }}
@@ -398,6 +401,11 @@ const ProfilePage = ({ onExchangeClick, userRole, onAdminClick }) => {
                     ))}
                   </Tbody>
                 </Table>
+                <Text mt={4}>
+                  Average: ${transactions.filter(tx => tx.status === 'completed')
+                    .reduce((sum, tx) => sum + parseFloat(tx.amount_usd), 0) / 
+                    transactions.filter(tx => tx.status === 'completed').length || 0}
+                </Text>
               </Box>
             </TabPanel>
 

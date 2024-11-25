@@ -22,11 +22,11 @@ import {
 } from '@chakra-ui/react';
 import { FaUser, FaLock, FaEye, FaEyeSlash } from 'react-icons/fa';
 import { motion } from 'framer-motion';
+import api from '../api/axios';
 import axios from 'axios';
+import { endpoints } from '../config/api';
 
 const MotionBox = motion(Box);
-
-const API_URL = 'http://localhost:3001/api';
 
 const AuthPage = ({ onAuthSuccess }) => {
   const [isLogin, setIsLogin] = useState(true);
@@ -47,38 +47,54 @@ const AuthPage = ({ onAuthSuccess }) => {
     });
   };
 
+  const API_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+
   const handleSubmit = async (e) => {
     e.preventDefault();
     setLoading(true);
+
     try {
-      let endpoint = isLogin ? 'login' : 'register';
+      // Validate passwords match for signup
       if (!isLogin && formData.password !== formData.confirmPassword) {
-        throw new Error('Passwords do not match');
+        toast({
+          title: 'Error',
+          description: 'Passwords do not match',
+          status: 'error',
+          duration: 5000,
+        });
+        return;
       }
 
-      const response = await axios.post(`http://localhost:3001/api/auth/${endpoint}`, {
+      const endpoint = isLogin ? '/api/auth/login' : '/api/auth/register';
+      const response = await axios.post(`${API_URL}${endpoint}`, {
         username: formData.username,
         password: formData.password
+      }, {
+        headers: {
+          'Content-Type': 'application/json'
+        }
       });
-
-      console.log('Auth response:', response.data);
       
       if (response.data.token) {
         localStorage.setItem('token', response.data.token);
         localStorage.setItem('userRole', response.data.role);
-        console.log('Setting userRole:', response.data.role);
+        
+        toast({
+          title: isLogin ? 'Login Successful' : 'Account Created',
+          description: isLogin ? 'Welcome back!' : 'Your account has been created successfully',
+          status: 'success',
+          duration: 5000,
+        });
+        
         onAuthSuccess(response.data.role);
-      } else {
-        throw new Error('No token received');
       }
     } catch (error) {
-      console.error('Auth error:', error);
+      console.error(isLogin ? 'Login error:' : 'Registration error:', error);
       toast({
         title: 'Error',
-        description: error.response?.data?.message || error.message || 'Authentication failed',
+        description: error.response?.data?.message || (isLogin ? 'Login failed' : 'Registration failed'),
         status: 'error',
         duration: 5000,
-        isClosable: true,
       });
     } finally {
       setLoading(false);

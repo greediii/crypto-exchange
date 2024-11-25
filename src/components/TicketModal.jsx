@@ -32,11 +32,15 @@ const TicketModal = ({ isOpen, onClose, ticketId, userRole }) => {
       try {
         if (!ticketId) return;
         
+        console.log('Fetching ticket details for ID:', ticketId);
+        
         const token = localStorage.getItem('token');
         const response = await axios.get(
           `http://localhost:3001/api/tickets/${ticketId}`,
           { headers: { Authorization: `Bearer ${token}` }}
         );
+        
+        console.log('Ticket details response:', response.data);
         
         if (response.data && response.data.ticket) {
           setTicket(response.data.ticket);
