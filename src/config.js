@@ -1,9 +1,9 @@
 const config = {
   API_URL: process.env.NODE_ENV === 'production' 
-    ? 'https://your-render-app.onrender.com' 
-    : 'http://localhost:3001',
+    ? 'https://crypto-exchange-8ppb.onrender.com/api' 
+    : 'http://localhost:3001/api',
   WS_URL: process.env.NODE_ENV === 'production'
-    ? 'wss://your-render-app.onrender.com/ws'
+    ? 'wss://crypto-exchange-8ppb.onrender.com/ws'
     : 'ws://localhost:3001/ws'
 };
 
