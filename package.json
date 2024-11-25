@@ -43,11 +43,11 @@
     "ws": "^8.18.0"
   },
   "scripts": {
-    "start": "react-scripts start",
+    "start": "node server/server.js",
     "build": "react-scripts build",
+    "dev": "react-scripts start",
     "server": "node server/server.js",
-    "server:dev": "nodemon server/server.js",
-    "dev": "concurrently \"npm run server:dev\" \"npm run start\""
+    "server:dev": "nodemon server/server.js"
   },
   "eslintConfig": {
     "extends": [

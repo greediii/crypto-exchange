@@ -1,8 +1,10 @@
-const isDevelopment = process.env.NODE_ENV === 'development';
-
 const config = {
-  API_URL: isDevelopment ? 'http://localhost:3001' : 'http://YOUR_SERVER_IP:3001',
-  WS_URL: isDevelopment ? 'ws://localhost:3001/ws' : 'ws://YOUR_SERVER_IP:3001/ws'
+  API_URL: process.env.NODE_ENV === 'production' 
+    ? 'https://your-render-app.onrender.com' 
+    : 'http://localhost:3001',
+  WS_URL: process.env.NODE_ENV === 'production'
+    ? 'wss://your-render-app.onrender.com/ws'
+    : 'ws://localhost:3001/ws'
 };
 
 export default config; 
